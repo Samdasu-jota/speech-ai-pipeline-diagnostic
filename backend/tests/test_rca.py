@@ -1,4 +1,16 @@
-"""Tests for Root Cause Analyzer causal graph matching."""
+"""Tests for Root Cause Analyzer causal graph matching.
+
+RCA rules are aligned with the Self English Tutor pipeline:
+  RCA-01/08   Noisy audio → bad Whisper transcription
+  RCA-02      CPU contention → GPT-4o latency
+  RCA-03      GPT-4o rate limit
+  RCA-04      External GPT-4o latency degradation
+  RCA-05      Cascading: bad transcription → bad feedback
+  RCA-06      Pipeline E2E timeout
+  RCA-07      Memory pressure
+  RCA-09      Low confidence → poor GPT-4o feedback quality
+  RCA-10      VAD / silence detection issue
+"""
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -35,15 +47,15 @@ class TestRootCauseAnalyzer:
         assert "noise" in result.probable_cause.lower()
         assert result.confidence >= 0.85
 
-    def test_rate_limit_scenario_matches_rca03(self):
-        fired = [_alert("LLM_RATE_LIMIT", "LLM-002", Severity.CRITICAL)]
+    def test_feedback_rate_limit_matches_rca03(self):
+        fired = [_alert("FBK_RATE_LIMIT", "FBK-002", Severity.CRITICAL)]
         result = self.rca.analyze(fired)
         assert result.matched_rule_id == "RCA-03"
         assert "rate limit" in result.probable_cause.lower()
 
-    def test_cpu_plus_latency_matches_rca02(self):
+    def test_cpu_plus_feedback_latency_matches_rca02(self):
         fired = [
-            _alert("LLM_LATENCY_SPIKE", "LLM-001", Severity.WARN),
+            _alert("FBK_LATENCY_SPIKE", "FBK-001", Severity.WARN),
             _alert("HIGH_CPU", "SYS-001", Severity.WARN),
         ]
         result = self.rca.analyze(fired)
@@ -76,12 +88,48 @@ class TestRootCauseAnalyzer:
         result = self.rca.analyze(fired)
         assert len(result.evidence) >= 1
 
-    def test_cascading_failure_scenario(self):
+    def test_cascading_failure_scenario_rca05(self):
         fired = [
             _alert("STT_HIGH_WER", "STT-001", Severity.CRITICAL),
-            _alert("LLM_LATENCY_SPIKE", "LLM-001", Severity.WARN),
+            _alert("FBK_LATENCY_SPIKE", "FBK-001", Severity.WARN),
         ]
         result = self.rca.analyze(fired)
-        # Should match RCA-05 (cascading) or have a valid cause
-        assert result.probable_cause
-        assert result.confidence > 0.0
+        assert result.matched_rule_id == "RCA-05"
+        assert "cascading" in result.probable_cause.lower()
+
+    def test_whisper_noise_confidence_matches_rca08(self):
+        """RCA-08: SNR + WER + low confidence score → Whisper noise degradation."""
+        fired = [
+            _alert("STT_HIGH_WER", "STT-001", Severity.CRITICAL),
+            _alert("STT_LOW_CONFIDENCE_SCORE", "STT-003", Severity.WARN, value=0.52),
+            _alert("LOW_AUDIO_SNR", "AUD-001", Severity.WARN),
+        ]
+        result = self.rca.analyze(fired)
+        assert result.matched_rule_id == "RCA-08"
+        assert result.confidence >= 0.90
+        assert "confidence" in result.probable_cause.lower()
+
+    def test_poor_feedback_quality_from_bad_transcription_rca09(self):
+        """RCA-09: Low confidence score + poor feedback quality → garbage-in-garbage-out."""
+        fired = [
+            _alert("FBK_POOR_QUALITY", "FBK-003", Severity.WARN, value=4.2),
+            _alert("STT_LOW_CONFIDENCE_SCORE", "STT-003", Severity.WARN, value=0.55),
+        ]
+        result = self.rca.analyze(fired)
+        assert result.matched_rule_id == "RCA-09"
+        assert "transcription" in result.probable_cause.lower()
+
+    def test_low_speech_ratio_matches_rca10(self):
+        """RCA-10: Low speech ratio alone → VAD / silence detection issue."""
+        fired = [
+            _alert("STT_LOW_SPEECH_RATIO", "STT-004", Severity.WARN, value=0.30),
+        ]
+        result = self.rca.analyze(fired)
+        assert result.matched_rule_id == "RCA-10"
+        assert "vad" in result.probable_cause.lower() or "silence" in result.probable_cause.lower()
+
+    def test_memory_pressure_matches_rca07(self):
+        fired = [_alert("HIGH_MEMORY", "SYS-002", Severity.CRITICAL)]
+        result = self.rca.analyze(fired)
+        assert result.matched_rule_id == "RCA-07"
+        assert "memory" in result.probable_cause.lower()

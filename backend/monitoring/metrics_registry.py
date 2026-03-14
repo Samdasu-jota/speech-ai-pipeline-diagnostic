@@ -3,6 +3,12 @@ Prometheus metrics registry — singleton that owns all instruments.
 
 All pipeline stages and the diagnostics engine read/write metrics through here,
 ensuring a single consistent namespace and preventing duplicate registration errors.
+
+Pipeline stages (aligned with Self English Tutor app):
+  1. Preprocessing  — audio capture, VAD, noise reduction
+  2. Transcription  — OpenAI Whisper API
+  3. Storage/Queue  — S3 upload + Celery queue
+  4. Feedback       — GPT-4o structured feedback generation
 """
 
 from __future__ import annotations
@@ -60,32 +66,45 @@ class MetricsRegistry:
     def _setup_instruments(self) -> None:
         r = self._registry
 
-        # ── Audio Stage ──────────────────────────────────────────────
+        # ── Preprocessing Stage ───────────────────────────────────────
         self.audio_snr_db = Gauge(
             "audio_snr_db", "Signal-to-noise ratio in dB", registry=r
         )
         self.audio_noise_floor_dbfs = Gauge(
             "audio_noise_floor_dbfs", "Noise floor in dBFS", registry=r
         )
+        self.audio_speech_ratio = Gauge(
+            "audio_speech_ratio",
+            "Fraction of audio containing speech (VAD output, 0-1)",
+            registry=r,
+        )
         self.audio_buffer_overflow_total = Counter(
             "audio_buffer_overflow_total", "Audio buffer overflow events", registry=r
         )
         self.audio_capture_latency_ms = Histogram(
             "audio_capture_latency_ms",
-            "Audio capture latency in ms",
+            "Audio capture + preprocessing latency in ms",
             buckets=_LATENCY_BUCKETS,
             registry=r,
         )
 
-        # ── STT Stage ────────────────────────────────────────────────
+        # ── Transcription Stage (Whisper) ─────────────────────────────
         self.stt_word_error_rate = Gauge(
             "stt_word_error_rate", "Current word error rate (0-1)", registry=r
         )
-        self.stt_confidence_score = Histogram(
+        self.stt_confidence_score = Gauge(
             "stt_confidence_score",
-            "STT confidence score per utterance",
+            "Current Whisper avg confidence score (0-1)",
+            registry=r,
+        )
+        self.stt_confidence_hist = Histogram(
+            "stt_confidence_hist",
+            "Whisper confidence score distribution per utterance",
             buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
             registry=r,
+        )
+        self.stt_word_count = Gauge(
+            "stt_word_count", "Word count of latest transcript", registry=r
         )
         self.stt_api_latency_ms = Histogram(
             "stt_api_latency_ms",
@@ -103,47 +122,45 @@ class MetricsRegistry:
             "stt_empty_transcript_total", "Empty STT transcripts returned", registry=r
         )
 
-        # ── NLP Stage ────────────────────────────────────────────────
-        self.nlp_processing_latency_ms = Histogram(
-            "nlp_processing_latency_ms",
-            "NLP processing latency in ms",
-            buckets=_LATENCY_BUCKETS,
-            registry=r,
+        # ── Storage / Queue Stage (S3 + Celery) ──────────────────────
+        self.storage_upload_latency_ms = Gauge(
+            "storage_upload_latency_ms", "S3 upload latency in ms", registry=r
         )
-        self.nlp_token_count = Histogram(
-            "nlp_token_count",
-            "Token count per NLP request",
-            buckets=(10, 50, 100, 200, 500, 1000, 2000),
-            registry=r,
-        )
-        self.nlp_parse_error_total = Counter(
-            "nlp_parse_error_total", "NLP parse errors", registry=r
+        self.celery_queue_depth = Gauge(
+            "celery_queue_depth", "Pending Celery task queue depth", registry=r
         )
 
-        # ── LLM Stage ────────────────────────────────────────────────
-        self.llm_api_latency_ms = Histogram(
-            "llm_api_latency_ms",
-            "LLM API latency in ms",
+        # ── Feedback Stage (GPT-4o) ───────────────────────────────────
+        self.feedback_api_latency_ms = Histogram(
+            "feedback_api_latency_ms",
+            "Feedback API (GPT-4o) latency in ms",
             buckets=_LATENCY_BUCKETS,
             registry=r,
         )
-        self.llm_tokens_per_second = Gauge(
-            "llm_tokens_per_second", "LLM throughput in tokens/s", registry=r
+        self.feedback_tokens_per_second = Gauge(
+            "feedback_tokens_per_second",
+            "Feedback API throughput in tokens/s",
+            registry=r,
         )
-        self.llm_api_error_total = Counter(
-            "llm_api_error_total",
-            "LLM API errors",
+        self.feedback_api_error_total = Counter(
+            "feedback_api_error_total",
+            "Feedback API errors",
             ["error_code"],
             registry=r,
         )
-        self.llm_retry_total = Counter(
-            "llm_retry_total", "LLM API retry attempts", registry=r
+        self.feedback_error_rate_429 = Gauge(
+            "feedback_error_rate_429",
+            "Feedback API (GPT-4o) 429 rate-limit error rate (fraction)",
+            registry=r,
         )
-        self.llm_context_overflow_total = Counter(
-            "llm_context_overflow_total", "LLM context window overflow events", registry=r
+        self.feedback_grammar_score = Gauge(
+            "feedback_grammar_score", "GPT-4o grammar score (0-10)", registry=r
         )
-        self.llm_error_rate_429 = Gauge(
-            "llm_error_rate_429", "LLM 429 error rate (fraction)", registry=r
+        self.feedback_fluency_score = Gauge(
+            "feedback_fluency_score", "GPT-4o fluency score (0-10)", registry=r
+        )
+        self.feedback_overall_score = Gauge(
+            "feedback_overall_score", "GPT-4o overall score (0-10)", registry=r
         )
 
         # ── System ───────────────────────────────────────────────────
@@ -182,10 +199,10 @@ class MetricsRegistry:
             registry=r,
         )
 
-        # LLM P99 latency (computed and stored as gauge for rule evaluation)
-        self.llm_api_latency_p99_ms = Gauge(
-            "llm_api_latency_p99_ms",
-            "LLM API P99 latency (rolling, ms)",
+        # P99 gauges (computed rolling, for rule evaluation)
+        self.feedback_api_latency_p99_ms = Gauge(
+            "feedback_api_latency_p99_ms",
+            "Feedback API P99 latency (rolling, ms)",
             registry=r,
         )
         self.pipeline_e2e_latency_p99_ms = Gauge(
@@ -202,8 +219,7 @@ class MetricsRegistry:
         hist_map = {
             "audio": self.audio_capture_latency_ms,
             "stt": self.stt_api_latency_ms,
-            "nlp": self.nlp_processing_latency_ms,
-            "llm": self.llm_api_latency_ms,
+            "feedback": self.feedback_api_latency_ms,
             "pipeline": self.pipeline_e2e_latency_ms,
         }
         hist = hist_map.get(stage)
@@ -215,8 +231,8 @@ class MetricsRegistry:
         self.pipeline_failure_total.labels(stage=stage).inc()
         if stage == "stt":
             self.stt_api_error_total.labels(error_type=error_type).inc()
-        elif stage == "llm":
-            self.llm_api_error_total.labels(error_code=error_type).inc()
+        elif stage == "feedback":
+            self.feedback_api_error_total.labels(error_code=error_type).inc()
 
     def _set(self, key: str, value: float) -> None:
         with self._cv_lock:
@@ -231,13 +247,21 @@ class MetricsRegistry:
         gauge_map: dict[str, Gauge] = {
             "audio_snr_db": self.audio_snr_db,
             "audio_noise_floor_dbfs": self.audio_noise_floor_dbfs,
+            "audio_speech_ratio": self.audio_speech_ratio,
             "stt_word_error_rate": self.stt_word_error_rate,
-            "llm_tokens_per_second": self.llm_tokens_per_second,
+            "stt_confidence_score": self.stt_confidence_score,
+            "stt_word_count": self.stt_word_count,
+            "storage_upload_latency_ms": self.storage_upload_latency_ms,
+            "celery_queue_depth": self.celery_queue_depth,
+            "feedback_tokens_per_second": self.feedback_tokens_per_second,
+            "feedback_error_rate_429": self.feedback_error_rate_429,
+            "feedback_grammar_score": self.feedback_grammar_score,
+            "feedback_fluency_score": self.feedback_fluency_score,
+            "feedback_overall_score": self.feedback_overall_score,
             "system_cpu_percent": self.system_cpu_percent,
             "system_memory_percent": self.system_memory_percent,
-            "llm_api_latency_p99_ms": self.llm_api_latency_p99_ms,
+            "feedback_api_latency_p99_ms": self.feedback_api_latency_p99_ms,
             "pipeline_e2e_latency_p99_ms": self.pipeline_e2e_latency_p99_ms,
-            "llm_error_rate_429": self.llm_error_rate_429,
         }
         if name in gauge_map:
             gauge_map[name].set(value)
@@ -254,13 +278,21 @@ class MetricsRegistry:
         # Pull live gauge values into snapshot
         base["audio_snr_db"] = self.audio_snr_db._value.get()  # type: ignore[attr-defined]
         base["audio_noise_floor_dbfs"] = self.audio_noise_floor_dbfs._value.get()  # type: ignore[attr-defined]
+        base["audio_speech_ratio"] = self.audio_speech_ratio._value.get()  # type: ignore[attr-defined]
         base["stt_word_error_rate"] = self.stt_word_error_rate._value.get()  # type: ignore[attr-defined]
-        base["llm_tokens_per_second"] = self.llm_tokens_per_second._value.get()  # type: ignore[attr-defined]
+        base["stt_confidence_score"] = self.stt_confidence_score._value.get()  # type: ignore[attr-defined]
+        base["stt_word_count"] = self.stt_word_count._value.get()  # type: ignore[attr-defined]
+        base["storage_upload_latency_ms"] = self.storage_upload_latency_ms._value.get()  # type: ignore[attr-defined]
+        base["celery_queue_depth"] = self.celery_queue_depth._value.get()  # type: ignore[attr-defined]
+        base["feedback_tokens_per_second"] = self.feedback_tokens_per_second._value.get()  # type: ignore[attr-defined]
+        base["feedback_error_rate_429"] = self.feedback_error_rate_429._value.get()  # type: ignore[attr-defined]
+        base["feedback_grammar_score"] = self.feedback_grammar_score._value.get()  # type: ignore[attr-defined]
+        base["feedback_fluency_score"] = self.feedback_fluency_score._value.get()  # type: ignore[attr-defined]
+        base["feedback_overall_score"] = self.feedback_overall_score._value.get()  # type: ignore[attr-defined]
         base["system_cpu_percent"] = self.system_cpu_percent._value.get()  # type: ignore[attr-defined]
         base["system_memory_percent"] = self.system_memory_percent._value.get()  # type: ignore[attr-defined]
-        base["llm_api_latency_p99_ms"] = self.llm_api_latency_p99_ms._value.get()  # type: ignore[attr-defined]
+        base["feedback_api_latency_p99_ms"] = self.feedback_api_latency_p99_ms._value.get()  # type: ignore[attr-defined]
         base["pipeline_e2e_latency_p99_ms"] = self.pipeline_e2e_latency_p99_ms._value.get()  # type: ignore[attr-defined]
-        base["llm_error_rate_429"] = self.llm_error_rate_429._value.get()  # type: ignore[attr-defined]
         return base
 
     # ------------------------------------------------------------------

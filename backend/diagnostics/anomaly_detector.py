@@ -23,10 +23,14 @@ from diagnostics.rules import RuleResult, Severity
 logger = logging.getLogger(__name__)
 
 # Metrics to watch for anomalies (these have no good fixed threshold)
+# Aligned with Self English Tutor pipeline: Whisper confidence + GPT-4o grammar score
+# are especially valuable for catching gradual quality drift.
 _WATCHED_METRICS = [
     "stt_word_error_rate",
+    "stt_confidence_score",
     "audio_snr_db",
-    "llm_api_latency_p99_ms",
+    "feedback_api_latency_p99_ms",
+    "feedback_grammar_score",
     "system_cpu_percent",
     "pipeline_e2e_latency_p99_ms",
 ]

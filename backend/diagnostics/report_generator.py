@@ -4,6 +4,12 @@ ReportGenerator — builds structured DiagnosticReport objects.
 Reports follow a standardised schema analogous to technician-facing
 service reports: they capture the pipeline health state, active alerts,
 root cause analysis, and a metric snapshot at the time of detection.
+
+Stage names are aligned with the Self English Tutor app's Celery pipeline:
+  preprocessing  → AudioStage (VAD, noise reduction)
+  transcription  → STTStage   (Whisper API)
+  storage        → StorageStage (S3 + Celery queue)
+  feedback       → FeedbackStage (GPT-4o)
 """
 
 from __future__ import annotations
@@ -27,21 +33,21 @@ def _pipeline_status(fired: list[RuleResult]) -> str:
 
 
 _STAGE_NAMES = [
-    "audio_capture",
-    "speech_to_text",
-    "language_processing",
-    "llm",
-    "output",
+    "preprocessing",
+    "transcription",
+    "storage",
+    "feedback",
     "system",
+    "pipeline",
 ]
 
 _STAGE_METRIC_RULES = {
-    "audio_capture": ["LOW_AUDIO_SNR"],
-    "speech_to_text": ["STT_HIGH_WER", "STT_LOW_CONFIDENCE"],
-    "language_processing": [],
-    "llm": ["LLM_LATENCY_SPIKE", "LLM_RATE_LIMIT"],
-    "output": [],
-    "system": ["HIGH_CPU", "HIGH_MEMORY", "PIPELINE_TIMEOUT"],
+    "preprocessing": ["LOW_AUDIO_SNR", "AUD_NEAR_SILENT"],
+    "transcription": ["STT_HIGH_WER", "STT_LOW_CONFIDENCE", "STT_LOW_CONFIDENCE_SCORE", "STT_LOW_SPEECH_RATIO"],
+    "storage": [],
+    "feedback": ["FBK_LATENCY_SPIKE", "FBK_RATE_LIMIT", "FBK_POOR_QUALITY"],
+    "system": ["HIGH_CPU", "HIGH_MEMORY"],
+    "pipeline": ["PIPELINE_TIMEOUT"],
 }
 
 
@@ -97,12 +103,17 @@ class ReportGenerator:
                 for k, v in snapshot.items()
                 if k in {
                     "stt_word_error_rate",
+                    "stt_confidence_score",
                     "audio_snr_db",
-                    "llm_api_latency_p99_ms",
+                    "audio_speech_ratio",
+                    "feedback_api_latency_p99_ms",
+                    "feedback_error_rate_429",
+                    "feedback_grammar_score",
+                    "feedback_overall_score",
+                    "celery_queue_depth",
                     "system_cpu_percent",
                     "system_memory_percent",
                     "pipeline_e2e_latency_p99_ms",
-                    "llm_error_rate_429",
                 }
             },
         )

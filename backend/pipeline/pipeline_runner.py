@@ -1,8 +1,11 @@
 """
 PipelineRunner — orchestrates the full speech AI pipeline.
 
-Wires together Audio → STT → NLP → LLM → Output and records
-the end-to-end latency and per-request correlation IDs.
+Mirrors the Self English Tutor app's Celery task flow:
+  Preprocessing → Transcription → Storage/Queue → Feedback Generation
+
+Wires together AudioStage → STTStage → StorageStage → FeedbackStage
+and records per-stage and end-to-end latency with correlation IDs.
 """
 
 from __future__ import annotations
@@ -17,9 +20,8 @@ from typing import Optional
 from monitoring.metrics_registry import MetricsRegistry
 from pipeline.audio_stage import AudioStage, AudioFrame
 from pipeline.stt_stage import STTStage, STTResult
-from pipeline.nlp_stage import NLPStage, NLPResult
-from pipeline.llm_stage import LLMStage, LLMResult
-from pipeline.output_stage import OutputStage, PipelineResponse
+from pipeline.storage_stage import StorageStage, StorageResult
+from pipeline.feedback_stage import FeedbackStage, FeedbackResult
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 class PipelineRunResult:
     session_id: str
     request_id: str
-    response: Optional[PipelineResponse]
+    feedback: Optional[FeedbackResult]
     e2e_latency_ms: float
     success: bool
     failed_stage: Optional[str] = None
@@ -40,17 +42,18 @@ class PipelineRunner:
     """
     Runs a single end-to-end pipeline request.
 
-    Each stage is executed sequentially and its output passed to the next.
-    The runner records per-request timing and pushes the E2E latency to
-    the MetricsRegistry.
+    Stage sequence:
+      1. Preprocessing (audio_stage) — simulate VAD + noise reduction
+      2. Transcription (stt_stage)   — Whisper API
+      3. Storage/Queue (storage_stage) — S3 upload + Celery dispatch
+      4. Feedback (feedback_stage)   — GPT-4o structured feedback
     """
 
     def __init__(self) -> None:
         self.audio = AudioStage()
         self.stt = STTStage()
-        self.nlp = NLPStage()
-        self.llm = LLMStage()
-        self.output = OutputStage()
+        self.storage = StorageStage()
+        self.feedback = FeedbackStage()
         self.registry = MetricsRegistry.instance()
 
     def run(
@@ -70,44 +73,37 @@ class PipelineRunner:
         stage_latencies: dict[str, float] = {}
 
         try:
-            # Stage 1 — Audio Capture
+            # Stage 1 — Preprocessing
             t = time.monotonic()
             frame: AudioFrame = self.audio.capture(
                 session_id=session_id, request_id=request_id
             )
-            stage_latencies["audio"] = (time.monotonic() - t) * 1000
+            stage_latencies["preprocessing"] = (time.monotonic() - t) * 1000
 
-            # Stage 2 — Speech-to-Text
+            # Stage 2 — Transcription
             t = time.monotonic()
             stt: STTResult = self.stt.transcribe(
                 frame, session_id=session_id, request_id=request_id
             )
-            stage_latencies["stt"] = (time.monotonic() - t) * 1000
+            stage_latencies["transcription"] = (time.monotonic() - t) * 1000
 
-            # Stage 3 — NLP
+            # Stage 3 — Storage / Queue
             t = time.monotonic()
-            nlp: NLPResult = self.nlp.process(
+            storage: StorageResult = self.storage.upload_and_enqueue(
                 stt, session_id=session_id, request_id=request_id
             )
-            stage_latencies["nlp"] = (time.monotonic() - t) * 1000
+            stage_latencies["storage"] = (time.monotonic() - t) * 1000
 
-            # Stage 4 — LLM
+            # Stage 4 — Feedback Generation
             t = time.monotonic()
-            llm: LLMResult = self.llm.correct(
-                nlp, session_id=session_id, request_id=request_id
+            fbk: FeedbackResult = self.feedback.generate(
+                stt, session_id=session_id, request_id=request_id
             )
-            stage_latencies["llm"] = (time.monotonic() - t) * 1000
-
-            # Stage 5 — Output
-            t = time.monotonic()
-            resp: PipelineResponse = self.output.deliver(
-                llm, session_id=session_id, request_id=request_id
-            )
-            stage_latencies["output"] = (time.monotonic() - t) * 1000
+            stage_latencies["feedback"] = (time.monotonic() - t) * 1000
 
             e2e_ms = (time.monotonic() - e2e_start) * 1000
             self.registry.pipeline_e2e_latency_ms.observe(e2e_ms)
-            self.registry.set_metric("pipeline_e2e_latency_p99_ms", e2e_ms)  # simplified: set last value
+            self.registry.set_metric("pipeline_e2e_latency_p99_ms", e2e_ms)
             self.registry.pipeline_request_total.inc()
 
             logger.info(
@@ -116,12 +112,14 @@ class PipelineRunner:
                     "session_id": session_id,
                     "request_id": request_id,
                     "e2e_latency_ms": round(e2e_ms, 2),
+                    "overall_score": fbk.overall_score,
+                    "job_id": storage.job_id,
                 },
             )
             return PipelineRunResult(
                 session_id=session_id,
                 request_id=request_id,
-                response=resp,
+                feedback=fbk,
                 e2e_latency_ms=e2e_ms,
                 success=True,
                 stage_latencies=stage_latencies,
@@ -144,7 +142,7 @@ class PipelineRunner:
             return PipelineRunResult(
                 session_id=session_id,
                 request_id=request_id,
-                response=None,
+                feedback=None,
                 e2e_latency_ms=e2e_ms,
                 success=False,
                 failed_stage=failed_stage,
@@ -164,12 +162,12 @@ class PipelineRunner:
 
 def _detect_failed_stage(stage_latencies: dict[str, float]) -> str:
     """Infer which stage failed based on which is the last completed stage."""
-    stage_order = ["audio", "stt", "nlp", "llm", "output"]
+    stage_order = ["preprocessing", "transcription", "storage", "feedback"]
     last_completed = None
     for stage in stage_order:
         if stage in stage_latencies:
             last_completed = stage
     if last_completed is None:
-        return "audio"
+        return "preprocessing"
     idx = stage_order.index(last_completed)
     return stage_order[idx + 1] if idx + 1 < len(stage_order) else last_completed
